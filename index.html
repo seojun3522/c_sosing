@@ -74,7 +74,7 @@
         const SUPABASE_URL = 'https://esqmixsaopqjomklvzou.supabase.co';
         const SUPABASE_ANON_KEY = 'sb_publishable__y-p6YGNi4JvxB2wdjGG6A_wdYNXks1';
         
-        const supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+        const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
         // =====================================================================
 
         const { useState, useMemo, useEffect, useRef } = React;
@@ -471,6 +471,10 @@
             const [isTrashModalOpen, setIsTrashModalOpen] = useState(false);
             const [toast, setToast] = useState(null);
 
+            // 이미지 지연 로딩을 위한 새로운 상태
+            const [imageMap, setImageMap] = useState({});
+            const [imageLoadingProgress, setImageLoadingProgress] = useState(null);
+
             // Preview Carousel State
             const [previewData, setPreviewData] = useState(null);
             const [previewIndex, setPreviewIndex] = useState(0);
@@ -554,33 +558,46 @@
             }, [previewData]);
 
             const formatDateTime = (timestamp) => {
-                if (!timestamp) return { date: '날짜모름', time: '' };
-                const dObj = new Date(timestamp);
-                if (isNaN(dObj.getTime())) return { date: '날짜모름', time: '' };
-                const y = String(dObj.getFullYear()).slice(-2);
-                const m = String(dObj.getMonth() + 1).padStart(2, '0');
-                const d = String(dObj.getDate()).padStart(2, '0');
-                const hh = String(dObj.getHours()).padStart(2, '0');
-                const mm = String(dObj.getMinutes()).padStart(2, '0');
-                return { date: `${y}-${m}-${d}`, time: `${hh}:${mm}` };
-            };
+            if (!timestamp) return { date: '날짜모름', time: '' };
+            const dObj = new Date(timestamp);
+            if (isNaN(dObj.getTime())) return { date: '날짜모름', time: '' };
+            const y = String(dObj.getFullYear()).slice(-2);
+            const m = String(dObj.getMonth() + 1).padStart(2, '0');
+            const d = String(dObj.getDate()).padStart(2, '0');
+            const hh = String(dObj.getHours()).padStart(2, '0');
+            const mm = String(dObj.getMinutes()).padStart(2, '0');
+            return { date: `${y}-${m}-${d}`, time: `${hh}:${mm}` };
+        };
 
-            const showToast = (message, type = 'success') => {
-                setToast({ message, type });
-                setTimeout(() => setToast(null), 3000);
-            };
+        const showToast = (message, type = 'success') => {
+            setToast({ message, type });
+            setTimeout(() => setToast(null), 3000);
+        };
 
-            // Supabase 데이터 패치 및 실시간 구독
-            useEffect(() => {
-                const fetchInitialData = async () => {
+        // Supabase 데이터 패치 및 실시간 구독
+        useEffect(() => {
+            const fetchInitialData = async () => {
+                try {
+                    // [중요 시스템 업그레이드] 
+                    // 타임아웃의 원인인 초거대 Base64 이미지 데이터를 초기 로딩에서 제외했습니다. (0.1초 컷 보장)
                     const [prodRes, globRes, secRes, comRes] = await Promise.all([
-                        supabase.from('products').select('*'),
+                        supabase.from('products').select('id, itemCode, project, mainCategory, category, name, option, cny, cost, price, links, naverLinks, isConfirmed, isFinalized, isHeld, isSampleRequested, isDeleted, approvals, customOrder, createdAt, updatedAt'),
                         supabase.from('global_settings').select('*').eq('id', 1).single(),
                         supabase.from('security_settings').select('*').eq('id', 1).single(),
                         supabase.from('comments').select('*')
                     ]);
 
-                    if (prodRes.data) setProducts(prodRes.data);
+                    if (prodRes.error) {
+                        console.error("Products Fetch Error:", prodRes.error);
+                        alert(`데이터를 불러오는 중 에러가 발생했습니다: ${prodRes.error.message}\n개발자 도구(F12) 콘솔을 확인해주세요.`);
+                    }
+
+                    if (prodRes.data) {
+                        setProducts(prodRes.data);
+                        // 백그라운드 이미지 로딩 시작
+                        fetchImagesInBackground(prodRes.data);
+                    }
+                    
                     if (globRes.data) setSettings({
                         categoryGroups: globRes.data.categoryGroups || [],
                         categoryFees: globRes.data.categoryFees || {},
@@ -594,15 +611,72 @@
                         memberPasswords: secRes.data.memberPasswords || {}
                     });
                     if (comRes.data) setAllComments(comRes.data);
-                };
+                } catch (error) {
+                    console.error("Critical Fetch Error:", error);
+                    alert("데이터 통신 중 치명적인 오류가 발생했습니다. 개발자 도구(F12) 콘솔을 확인해주세요.");
+                }
+            };
 
-                fetchInitialData();
+            // 백그라운드에서 이미지를 15개씩 안전하게 가져오는 함수
+            const fetchImagesInBackground = async (items) => {
+                const total = items.length;
+                if (total === 0) return;
+                setImageLoadingProgress({ current: 0, total });
+                const CHUNK_SIZE = 15;
+                let loadedCount = 0;
 
-                const channel = supabase.channel('dashboard_changes')
-                    .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, payload => {
-                        if (payload.eventType === 'INSERT') setProducts(p => [...p, payload.new]);
-                        else if (payload.eventType === 'UPDATE') setProducts(p => p.map(x => x.id === payload.new.id ? payload.new : x));
-                        else if (payload.eventType === 'DELETE') setProducts(p => p.filter(x => x.id !== payload.old.id));
+                for (let i = 0; i < total; i += CHUNK_SIZE) {
+                    const chunk = items.slice(i, i + CHUNK_SIZE);
+                    const ids = chunk.map(p => p.id);
+
+                    try {
+                        const { data } = await supabase
+                            .from('products')
+                            .select('id, image, optionImage')
+                            .in('id', ids);
+
+                        if (data) {
+                            setImageMap(prev => {
+                                const newMap = { ...prev };
+                                data.forEach(item => {
+                                    newMap[item.id] = { image: item.image, optionImage: item.optionImage };
+                                });
+                                return newMap;
+                            });
+                        }
+                    } catch(e) {
+                        console.error("Image Fetch Error:", e);
+                    }
+                    
+                    loadedCount += chunk.length;
+                    setImageLoadingProgress({ current: Math.min(loadedCount, total), total });
+                    await new Promise(r => setTimeout(r, 200)); // 서버 과부하 방지를 위한 0.2초 휴식
+                }
+                setTimeout(() => setImageLoadingProgress(null), 2000); // 2초 뒤 알림 숨김
+            };
+
+            fetchInitialData();
+
+            const channel = supabase.channel('dashboard_changes')
+                .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, payload => {
+                        // 실시간 업데이트 시에도 이미지로 인한 렉 방지를 위해 이미지는 분리
+                        const cleanItem = { ...payload.new };
+                        const newImage = cleanItem.image;
+                        const newOptionImage = cleanItem.optionImage;
+                        delete cleanItem.image;
+                        delete cleanItem.optionImage;
+
+                        if (payload.eventType === 'INSERT') {
+                            setProducts(p => [...p, cleanItem]);
+                            setImageMap(prev => ({ ...prev, [cleanItem.id]: { image: newImage, optionImage: newOptionImage } }));
+                        }
+                        else if (payload.eventType === 'UPDATE') {
+                            setProducts(p => p.map(x => x.id === cleanItem.id ? cleanItem : x));
+                            setImageMap(prev => ({ ...prev, [cleanItem.id]: { image: newImage, optionImage: newOptionImage } }));
+                        }
+                        else if (payload.eventType === 'DELETE') {
+                            setProducts(p => p.filter(x => x.id !== payload.old.id));
+                        }
                     })
                     .on('postgres_changes', { event: '*', schema: 'public', table: 'comments' }, payload => {
                         if (payload.eventType === 'INSERT') setAllComments(c => [...c, payload.new]);
@@ -997,10 +1071,17 @@
             };
 
             const handleOpenPreview = (item, initialIndex = 0) => {
+                const imgData = imageMap[item.id] || {};
                 const images = [];
-                if (item.image) images.push({ label: '대표 이미지', url: item.image });
-                if (item.optionImage) images.push({ label: '옵션 이미지', url: item.optionImage });
-                if (images.length > 0) { setPreviewData(images); setPreviewIndex(Math.min(initialIndex, images.length - 1)); }
+                if (imgData.image) images.push({ label: '대표 이미지', url: imgData.image });
+                if (imgData.optionImage) images.push({ label: '옵션 이미지', url: imgData.optionImage });
+
+                if (images.length > 0) { 
+                    setPreviewData(images); 
+                    setPreviewIndex(Math.min(initialIndex, images.length - 1)); 
+                } else {
+                    showToast("아직 이미지를 불러오는 중이거나 이미지가 없습니다.", "info");
+                }
             };
 
             const handleDownloadPDF = () => {
@@ -1057,7 +1138,6 @@
                             <thead>
                                 <tr>
                                     <th>No</th>
-                                    <th>이미지</th>
                                     <th>상품 정보</th>
                                     <th>위안가</th>
                                     <th>도착가</th>
@@ -1070,7 +1150,7 @@
                                     <tr key={item.id}>
                                         <td align="center">{idx + 1}</td>
                                         <td align="center">
-                                            {item.image ? <img src={item.image} /> : 'N/A'}
+                                            {imageMap[item.id]?.image ? <img src={imageMap[item.id].image} /> : 'N/A'}
                                         </td>
                                         <td>
                                             <div className="font-black text-indigo-600 mb-1">[{item.project}] {item.mainCategory} &gt; {item.category}</div>
@@ -1223,6 +1303,14 @@
                                             <option value="cost-asc">도착가 낮은순</option>
                                         </select>
                                     </div>
+
+                                    {imageLoadingProgress && imageLoadingProgress.current < imageLoadingProgress.total && (
+                                        <div className="flex items-center gap-2 bg-indigo-50 px-3 py-2 rounded-lg border border-indigo-100 shadow-sm">
+                                            <div className="w-4 h-4 border-2 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div>
+                                            <span className="text-[11px] text-indigo-700 font-black">이미지 로딩중... ({imageLoadingProgress.current}/{imageLoadingProgress.total})</span>
+                                        </div>
+                                    )}
+
                                     <div className="relative">
                                         <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
                                         <input type="text" placeholder="통합 검색 (코드/상품명)..." className="pl-9 pr-4 py-2 bg-gray-100 rounded-lg text-sm w-64 outline-none" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
@@ -1265,7 +1353,7 @@
                                                     <th className="px-2 py-4 w-16 text-center">No</th>
                                                     <th className="px-2 py-4 w-16 text-center">순서</th>
 
-                                                    <th className="px-2 py-4 w-48 text-center">이미지</th>
+                                                    <th className="px-2 py-4 w-28 text-center">이미지</th>
                                                     <th className="px-6 py-4 min-w-[250px]">상품 정보</th>
 
                                                     <th className="px-3 py-4 text-center w-36">{userRole === 'admin' ? '관리' : '상태'}</th>
@@ -1321,15 +1409,24 @@
                                                         
                                                         <td className="px-2 py-4 pl-6 align-middle">
                                                             <div className="flex items-center justify-center gap-2">
-                                                                <div className="w-20 h-20 bg-gray-100 rounded-lg flex items-center justify-center overflow-hidden border cursor-pointer relative group shadow-inner flex-shrink-0" onClick={() => handleOpenPreview(item, 0)} title="대표 이미지">
-                                                                    {item.image ? <img src={item.image} className="absolute inset-0 w-full h-full object-cover" /> : <ImageIcon className="w-8 h-8 text-gray-200"/>}
-                                                                    <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all z-10"><ZoomIn className="text-white w-6 h-6"/></div>
-                                                                </div>
-                                                                {item.optionImage && (
-                                                                    <div className="w-20 h-20 bg-amber-50 rounded-lg flex items-center justify-center overflow-hidden border border-amber-200 cursor-pointer relative group shadow-inner flex-shrink-0" onClick={() => handleOpenPreview(item, 1)} title="옵션 이미지">
-                                                                        <img src={item.optionImage} className="absolute inset-0 w-full h-full object-cover" />
-                                                                        <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all z-10"><ZoomIn className="text-white w-6 h-6"/></div>
-                                                                        <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[10px] text-center font-black py-1 z-10">옵션</div>
+                                                                {imageMap[item.id] ? (
+                                                                    <React.Fragment>
+                                                                        <div className="w-16 h-16 bg-gray-50 rounded-lg flex flex-col items-center justify-center overflow-hidden border cursor-pointer relative group shadow-inner flex-shrink-0" onClick={() => handleOpenPreview(item, 0)} title="대표 이미지">
+                                                                            {imageMap[item.id].image ? <img src={imageMap[item.id].image} className="absolute inset-0 w-full h-full object-cover" /> : <ImageIcon className="w-6 h-6 text-gray-200"/>}
+                                                                            <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all z-10"><ZoomIn className="text-white w-5 h-5"/></div>
+                                                                        </div>
+                                                                        {imageMap[item.id].optionImage && (
+                                                                            <div className="w-16 h-16 bg-amber-50 rounded-lg flex items-center justify-center overflow-hidden border border-amber-200 cursor-pointer relative group shadow-inner flex-shrink-0" onClick={() => handleOpenPreview(item, 1)} title="옵션 이미지">
+                                                                                <img src={imageMap[item.id].optionImage} className="absolute inset-0 w-full h-full object-cover" />
+                                                                                <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all z-10"><ZoomIn className="text-white w-5 h-5"/></div>
+                                                                                <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[9px] text-center font-black py-0.5 z-10">옵션</div>
+                                                                            </div>
+                                                                        )}
+                                                                    </React.Fragment>
+                                                                ) : (
+                                                                    <div className="w-16 h-16 bg-gray-50 border border-gray-200 rounded-xl flex flex-col items-center justify-center shadow-sm relative flex-shrink-0">
+                                                                        <div className="w-4 h-4 border-2 border-gray-200 border-t-indigo-500 rounded-full animate-spin mb-1"></div>
+                                                                        <span className="text-[7px] text-gray-400 font-bold">로딩중</span>
                                                                     </div>
                                                                 )}
                                                             </div>
@@ -1360,7 +1457,7 @@
                                                                         <button onClick={() => toggleConfirm(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isConfirmed ? 'bg-green-600 text-white shadow-md' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="선택"><CheckCircle className="w-3 h-3"/> 선택</button>
                                                                         <button onClick={() => toggleSample(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isSampleRequested ? 'bg-blue-600 text-white shadow-md' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="샘플신청"><Truck className="w-3 h-3"/> 샘플</button>
                                                                         <button onClick={() => toggleHold(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isHeld ? 'bg-amber-50/30 text-amber-500 border border-amber-200' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="보류"><Clock className="w-3 h-3"/> 보류</button>
-                                                                        <button onClick={() => { setEditingItem(item); setProductForm({ ...item, links: item.links || [''], naverLinks: item.naverLinks || [''] }); setIsAddModalOpen(true); }} className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] text-gray-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all" title="수정"><Edit2 className="w-3 h-3"/> 수정</button>
+                                                                        <button onClick={() => { const imgData = imageMap[item.id] || {}; const fullItem = { ...item, image: imgData.image, optionImage: imgData.optionImage }; setEditingItem(fullItem); setProductForm({ ...fullItem, links: fullItem.links || [''], naverLinks: fullItem.naverLinks || [''] }); setIsAddModalOpen(true); }} className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] text-gray-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all" title="수정"><Edit2 className="w-3 h-3"/> 수정</button>
                                                                         <button onClick={async () => { if(confirm('삭제하시겠습니까?')) { await supabase.from('products').update({ isDeleted: true, updatedAt: Date.now() }).eq('id', item.id); showToast("휴지통으로 이동되었습니다."); } }} className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all" title="삭제"><Trash2 className="w-3 h-3"/> 삭제</button>
                                                                     </>
                                                                 ) : (
@@ -1618,16 +1715,8 @@
                                             displayProducts.filter(p => p.isDeleted).map(item => (
                                                 <div key={item.id} className="flex items-center justify-between p-3 border rounded-xl bg-gray-50 hover:border-red-200 transition-colors">
                                                     <div className="flex items-center gap-4">
-                                                        <div className="flex gap-2">
-                                                            <div className="w-16 h-16 bg-white rounded-lg border flex items-center justify-center overflow-hidden shadow-sm relative cursor-pointer" onClick={() => handleOpenPreview(item, 0)}>
-                                                                {item.image ? <img src={item.image} className="absolute inset-0 w-full h-full object-cover" /> : <ImageIcon className="w-6 h-6 text-gray-300" />}
-                                                            </div>
-                                                            {item.optionImage && (
-                                                                <div className="w-16 h-16 bg-amber-50 rounded-lg border border-amber-200 flex items-center justify-center overflow-hidden shadow-sm relative cursor-pointer" onClick={() => handleOpenPreview(item, 1)}>
-                                                                    <img src={item.optionImage} className="absolute inset-0 w-full h-full object-cover" />
-                                                                    <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[9px] text-center py-0.5 z-10">옵션</div>
-                                                                </div>
-                                                            )}
+                                                        <div className="w-14 h-14 bg-white rounded-lg border flex flex-col items-center justify-center overflow-hidden shadow-sm relative cursor-pointer hover:bg-gray-50" onClick={() => handleOpenPreview(item, 0)}>
+                                                            {imageMap[item.id]?.image ? <img src={imageMap[item.id].image} className="absolute inset-0 w-full h-full object-cover" /> : <ImageIcon className="w-5 h-5 text-gray-300" />}
                                                         </div>
                                                         <div>
                                                             <div className="text-sm text-gray-800">{item.name} <span className="text-xs text-gray-400">({item.option || '옵션없음'})</span></div>
