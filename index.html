@@ -190,9 +190,26 @@
             useEffect(() => {
                 const initAndFetch = async () => {
                     try {
-                        const { data } = await supabase.from('security_settings').select('*').eq('id', 1).single();
-                        if (data) {
-                            setServerPasswords({ master: data.master || DEFAULT_MASTER_PW, memberPasswords: data.memberPasswords || {} });
+                        const [secRes, globRes] = await Promise.all([
+                            supabase.from('security_settings').select('*').eq('id', 1).single(),
+                            supabase.from('global_settings').select('teamMembers').eq('id', 1).single()
+                        ]);
+                        
+                        if (secRes.data) {
+                            // [핵심 해결] 삭제된 팀원의 유령 비밀번호를 로그인 전에 필터링합니다.
+                            const activeMembers = globRes.data?.teamMembers || [];
+                            const activeKeys = activeMembers.map(m => m.key);
+                            
+                            const validPasswords = {};
+                            const rawPasswords = secRes.data.memberPasswords || {};
+                            
+                            Object.keys(rawPasswords).forEach(k => {
+                                if (activeKeys.includes(k)) {
+                                    validPasswords[k] = rawPasswords[k];
+                                }
+                            });
+
+                            setServerPasswords({ master: secRes.data.master || DEFAULT_MASTER_PW, memberPasswords: validPasswords });
                         }
                     } catch (e) { console.error(e); } finally { setLoading(false); }
                 };
@@ -203,7 +220,7 @@
                 e.preventDefault();
                 if (inputPw === serverPasswords.master) onLogin('admin', 'master');
                 else {
-                    const memberKey = Object.keys(serverPasswords.memberPasswords).find(key => serverPasswords.memberPasswords[key] === inputPw);
+                    const memberKey = Object.keys(serverPasswords.memberPasswords).find(key => serverPasswords.memberPasswords[key] === inputPw && inputPw.trim() !== "");
                     if (memberKey) onLogin('member', memberKey);
                     else if (inputPw === "5678") onLogin('member', 'guest');
                     else { setError(true); setInputPw(""); }
@@ -235,7 +252,16 @@
             const [masterPw, setMasterPw] = useState(currentSecurity?.master || DEFAULT_MASTER_PW);
             const [memberPwMap, setMemberPwMap] = useState(currentSecurity?.memberPasswords || {});
 
-            const handleSave = () => onSave(projs, team, { master: masterPw, memberPasswords: memberPwMap });
+            const handleSave = () => {
+                // [핵심 해결] 팀원 목록에 없는 찌꺼기 비밀번호를 아예 저장되지 않도록 정리합니다.
+                const cleanMemberPwMap = {};
+                team.forEach(m => {
+                    if (memberPwMap[m.key] !== undefined) {
+                        cleanMemberPwMap[m.key] = memberPwMap[m.key];
+                    }
+                });
+                onSave(projs, team, { master: masterPw, memberPasswords: cleanMemberPwMap });
+            };
 
             return (
                 <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4 font-bold">
