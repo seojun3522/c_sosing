@@ -77,7 +77,7 @@
         const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
         // =====================================================================
 
-        const { useState, useMemo, useEffect, useRef } = React;
+        const { useState, useMemo, useEffect, useRef, useCallback } = React;
 
         const DEFAULT_MASTER_PW = "3522";
         const DEFAULT_MEMBER_PW = "5678";
@@ -136,6 +136,19 @@
             Package, Search, Check, X, Minus, Calculator, ImageIcon, Trash2, Plus, Settings, Edit2, 
             StickyNote, ChevronRight, LayoutDashboard, CheckCircle, ZoomIn, Cloud, RefreshCw, Truck, Menu, Download, Upload, Clock, Flag, ChevronUp, ChevronDown, ChevronsUp, ChevronsDown, Lock, Shield, User, Key, FileText, RotateCcw, Layers, FolderTree, Eye, Calendar, ChevronsUpDown, ArrowUpDown, MessageSquare, Send, FilePdf
         } = Icons;
+
+        // --- 재사용 가능한 포맷팅 함수 분리 ---
+        const formatDateTime = (timestamp) => {
+            if (!timestamp) return { date: '날짜모름', time: '' };
+            const dObj = new Date(timestamp);
+            if (isNaN(dObj.getTime())) return { date: '날짜모름', time: '' };
+            const y = String(dObj.getFullYear()).slice(-2);
+            const m = String(dObj.getMonth() + 1).padStart(2, '0');
+            const d = String(dObj.getDate()).padStart(2, '0');
+            const hh = String(dObj.getHours()).padStart(2, '0');
+            const mm = String(dObj.getMinutes()).padStart(2, '0');
+            return { date: `${y}-${m}-${d}`, time: `${hh}:${mm}` };
+        };
 
         class ErrorBoundary extends React.Component {
             constructor(props) {
@@ -196,7 +209,6 @@
                         ]);
                         
                         if (secRes.data) {
-                            // [핵심 해결] 삭제된 팀원의 유령 비밀번호를 로그인 전에 필터링합니다.
                             const activeMembers = globRes.data?.teamMembers || [];
                             const activeKeys = activeMembers.map(m => m.key);
                             
@@ -253,7 +265,6 @@
             const [memberPwMap, setMemberPwMap] = useState(currentSecurity?.memberPasswords || {});
 
             const handleSave = () => {
-                // [핵심 해결] 팀원 목록에 없는 찌꺼기 비밀번호를 아예 저장되지 않도록 정리합니다.
                 const cleanMemberPwMap = {};
                 team.forEach(m => {
                     if (memberPwMap[m.key] !== undefined) {
@@ -438,27 +449,35 @@
                 const member = teamMembers && teamMembers.find(m => m.key === userKey);
                 const userName = member ? member.label : (userRole === 'admin' ? 'Master' : 'Guest');
                 
-                await supabase.from('comments').insert([{
+                const { error } = await supabase.from('comments').insert([{
                     productId,
                     userId: userKey,
                     userName,
                     text,
                     createdAt: Date.now()
                 }]);
-                setText("");
+                
+                if (error) {
+                    alert("댓글 저장에 실패했습니다: " + error.message);
+                } else {
+                    setText("");
+                }
             };
 
             const handleDelete = async (id) => {
                 if(confirm("댓글을 삭제하시겠습니까?")) {
-                    await supabase.from('comments').delete().eq('id', id);
+                    const { error } = await supabase.from('comments').delete().eq('id', id);
+                    if (error) {
+                        alert("댓글 삭제에 실패했습니다: " + error.message);
+                    }
                 }
             };
 
             return (
                 <div className="flex flex-col gap-1 h-32 border border-gray-200 rounded-xl bg-gray-50 overflow-hidden relative shadow-inner">
                     <div ref={scrollRef} className="flex-1 overflow-y-auto p-2 space-y-2 custom-scrollbar text-[11px] font-black">
-                        {comments.length === 0 && <div className="text-gray-400 text-center mt-6 text-[10px]">의견이 없습니다.</div>}
-                        {comments.map(c => (
+                        {(!comments || comments.length === 0) && <div className="text-gray-400 text-center mt-6 text-[10px]">의견이 없습니다.</div>}
+                        {(comments || []).map(c => (
                             <div key={c.id} className={`flex flex-col ${c.userId === userKey ? 'items-end' : 'items-start'}`}>
                                 <div className="flex items-center gap-1 mb-0.5">
                                     <span className="text-[10px] text-gray-500">{c.userName}</span>
@@ -480,6 +499,166 @@
                 </div>
             )
         };
+
+        // --- 성능 개선 핵심 컴포넌트: 전체 리렌더링을 막기 위한 Row 분리 및 Memoization ---
+        const ProductTableRow = React.memo(({ 
+            item, idx, isSelected, isEditingNo, editingNoValue, 
+            userRole, userKey, sortConfig, imageMapData, comments, settings,
+            onSelectItem, onSetEditingNoValue, onSubmitNewNo, onStartEditingNo,
+            onMoveOrder, onOpenPreview, onToggleFinalize, onToggleConfirm,
+            onToggleSample, onToggleHold, onSetEditingItem, onSetProductForm,
+            onSetIsAddModalOpen, onToggleStatus, onToggleDelete, showToast
+        }) => {
+            return (
+                <tr className={`hover:bg-gray-50/50 transition-colors ${item.isFinalized ? 'bg-red-50/40' : item.isConfirmed ? 'bg-green-50/30' : item.isHeld ? 'bg-amber-50/30' : ''} ${isSelected ? 'bg-blue-50/30' : ''}`}>
+                    {userRole === 'admin' && (
+                        <td className="px-4 py-4 text-center align-middle">
+                            <input type="checkbox" checked={isSelected} onChange={() => onSelectItem(item.id)} className="w-4 h-4 accent-indigo-600 cursor-pointer"/>
+                        </td>
+                    )}
+                    <td className="px-2 py-4 text-center font-black align-middle">
+                        {isEditingNo ? (
+                            <input type="number" value={editingNoValue} onChange={(e) => onSetEditingNoValue(e.target.value)} onBlur={() => onSubmitNewNo(item, idx)} onKeyDown={(e) => { if (e.key === 'Enter') onSubmitNewNo(item, idx); else if (e.key === 'Escape') onSetEditingNoValue(null); }} className="w-12 text-center border-2 border-indigo-400 rounded outline-none text-indigo-700 py-1" autoFocus />
+                        ) : (
+                            <div onClick={() => { if (userRole === 'admin') onStartEditingNo(item, idx + 1); else showToast("팀원은 순서를 변경할 수 없습니다.", "error"); }} className={`inline-block px-2 py-1.5 rounded font-mono text-sm transition-all ${userRole === 'admin' && sortConfig.key === 'customOrder' ? 'cursor-pointer text-indigo-600 bg-indigo-50 hover:bg-indigo-100 hover:scale-110 border border-indigo-100 shadow-sm' : 'text-gray-400'}`} title="숫자를 클릭하여 원하는 순서로 즉시 이동">
+                                {idx + 1}
+                            </div>
+                        )}
+                    </td>
+                    <td className="px-2 py-4 text-center align-middle">
+                        {userRole === 'admin' && sortConfig.key === 'customOrder' && sortConfig.direction === 'asc' ? (
+                            <div className="flex flex-col items-center justify-center gap-1">
+                                <button onClick={() => onMoveOrder(idx, 'up')} disabled={idx === 0} className="w-7 h-7 flex items-center justify-center bg-gray-100 rounded-md hover:bg-indigo-100 hover:text-indigo-600 disabled:opacity-20 transition-all shadow-sm border"><ChevronUp className="w-4 h-4" /></button>
+                                <button onClick={() => onMoveOrder(idx, 'down')} className="w-7 h-7 flex items-center justify-center bg-gray-100 rounded-md hover:bg-indigo-100 hover:text-indigo-600 disabled:opacity-20 transition-all shadow-sm border"><ChevronDown className="w-4 h-4" /></button>
+                            </div>
+                        ) : <span className="text-[10px] text-gray-300">-</span>}
+                    </td>
+                    
+                    <td className="px-2 py-4 pl-6 align-middle">
+                        <div className="flex items-center justify-center gap-2">
+                            {imageMapData ? (
+                                <React.Fragment>
+                                    <div className="w-16 h-16 bg-gray-50 rounded-lg flex flex-col items-center justify-center overflow-hidden border cursor-pointer relative group shadow-inner flex-shrink-0" onClick={() => onOpenPreview(item, 0)} title="대표 이미지">
+                                        {imageMapData.image ? <img src={imageMapData.image} className="absolute inset-0 w-full h-full object-cover" /> : <ImageIcon className="w-6 h-6 text-gray-200"/>}
+                                        <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all z-10"><ZoomIn className="text-white w-5 h-5"/></div>
+                                    </div>
+                                    {imageMapData.optionImage && (
+                                        <div className="w-16 h-16 bg-amber-50 rounded-lg flex items-center justify-center overflow-hidden border border-amber-200 cursor-pointer relative group shadow-inner flex-shrink-0" onClick={() => onOpenPreview(item, 1)} title="옵션 이미지">
+                                            <img src={imageMapData.optionImage} className="absolute inset-0 w-full h-full object-cover" />
+                                            <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all z-10"><ZoomIn className="text-white w-5 h-5"/></div>
+                                            <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[9px] text-center font-black py-0.5 z-10">옵션</div>
+                                        </div>
+                                    )}
+                                </React.Fragment>
+                            ) : (
+                                <div className="w-16 h-16 bg-gray-50 border border-gray-200 rounded-xl flex flex-col items-center justify-center shadow-sm relative flex-shrink-0">
+                                    <div className="w-4 h-4 border-2 border-gray-200 border-t-indigo-500 rounded-full animate-spin mb-1"></div>
+                                    <span className="text-[7px] text-gray-400 font-bold">로딩중</span>
+                                </div>
+                            )}
+                        </div>
+                    </td>
+                    <td className="px-6 py-4 min-w-[200px] align-middle">
+                        <div className="flex flex-col gap-0.5">
+                            <div className="flex items-center gap-1.5 mb-1">
+                                <span className="text-[9px] bg-indigo-50 text-indigo-500 px-1.5 py-0.5 rounded border border-indigo-100">{item.project}</span>
+                                <span className="text-[9px] text-gray-400">{(item.mainCategory || "미분류")} &gt; {(item.category || "미지정")}</span>
+                            </div>
+                            <div className="text-gray-900 line-clamp-1 flex items-center gap-2 text-base">
+                                <span className="text-[9px] text-gray-400 font-mono border border-gray-200 px-1 rounded bg-gray-50">#{item.itemCode || item.id.slice(-6).toUpperCase()}</span>
+                                {item.name}
+                            </div>
+                            <div className="text-xs text-gray-400 italic line-clamp-1 mt-1">{item.option || '옵션없음'}</div>
+                            <div className="flex gap-1.5 mt-2">
+                                {(item.links || []).filter(l => l).map((l, i) => <a key={i} href={l} target="_blank" className="bg-orange-50 text-orange-600 text-[9px] px-1.5 py-0.5 rounded border border-orange-100 hover:bg-orange-100 transition-colors">소싱 #{i+1}</a>)}
+                                {(item.naverLinks || []).filter(l => l).map((l, i) => <a key={i} href={l} target="_blank" className="bg-green-50 text-green-600 text-[9px] px-1.5 py-0.5 rounded border border-green-100 hover:bg-green-100 transition-colors">경쟁 #{i+1}</a>)}
+                            </div>
+                        </div>
+                    </td>
+
+                    <td className="px-3 py-4 align-middle">
+                        <div className="grid grid-cols-2 gap-1.5 w-max mx-auto">
+                            {userRole === 'admin' ? (
+                                <>
+                                    <button onClick={() => onToggleFinalize(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isFinalized ? 'bg-red-600 text-white shadow-md' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="확정"><Flag className="w-3 h-3"/> 확정</button>
+                                    <button onClick={() => onToggleConfirm(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isConfirmed ? 'bg-green-600 text-white shadow-md' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="선택"><CheckCircle className="w-3 h-3"/> 선택</button>
+                                    <button onClick={() => onToggleSample(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isSampleRequested ? 'bg-blue-600 text-white shadow-md' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="샘플신청"><Truck className="w-3 h-3"/> 샘플</button>
+                                    <button onClick={() => onToggleHold(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isHeld ? 'bg-amber-50/30 text-amber-500 border border-amber-200' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="보류"><Clock className="w-3 h-3"/> 보류</button>
+                                    <button onClick={() => { const imgData = imageMapData || {}; const fullItem = { ...item, image: imgData.image, optionImage: imgData.optionImage }; onSetEditingItem(fullItem); onSetProductForm({ ...fullItem, links: fullItem.links || [''], naverLinks: fullItem.naverLinks || [''] }); onSetIsAddModalOpen(true); }} className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] text-gray-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all" title="수정"><Edit2 className="w-3 h-3"/> 수정</button>
+                                    <button onClick={() => onToggleDelete(item)} className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all" title="삭제"><Trash2 className="w-3 h-3"/> 삭제</button>
+                                </>
+                            ) : (
+                                <>
+                                    {item.isFinalized && <span className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg bg-red-100 text-red-700 border border-red-200"><Flag className="w-3 h-3"/> 확정</span>}
+                                    {item.isConfirmed && <span className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg bg-green-100 text-green-700 border border-green-200"><CheckCircle className="w-3 h-3"/> 선택</span>}
+                                    <button onClick={() => onToggleSample(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isSampleRequested ? 'bg-blue-600 text-white shadow-md' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="샘플신청"><Truck className="w-3 h-3"/> 샘플</button>
+                                    
+                                    {item.isHeld && <span className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg bg-amber-100 text-amber-700 border border-amber-200"><Clock className="w-3 h-3"/> 보류</span>}
+                                    
+                                    {!item.isConfirmed && !item.isFinalized && !item.isHeld && !item.isSampleRequested && <span className="w-full text-[11px] text-gray-400 px-2 py-1.5 flex items-center justify-center col-span-2">진행중</span>}
+                                </>
+                            )}
+                        </div>
+                    </td>
+
+                    <td className="px-4 py-4 w-72 min-w-[280px] align-middle bg-gray-50/30 border-r border-gray-100">
+                        <InlineComments 
+                            productId={item.id}
+                            comments={comments}
+                            userKey={userKey}
+                            userRole={userRole}
+                            teamMembers={settings.teamMembers}
+                        />
+                    </td>
+
+                    <td className="px-4 py-4 text-center align-middle">
+                        {(() => {
+                            const dt = formatDateTime(item.createdAt);
+                            return <div className="flex flex-col items-center justify-center gap-1"><span className="text-[15px] text-gray-800 tracking-wider">{dt.date}</span><span className="text-xs text-gray-500 font-mono">{dt.time}</span></div>;
+                        })()}
+                    </td>
+                    <td className="px-4 py-4 text-center align-middle">
+                        {(() => {
+                            const dt = formatDateTime(item.updatedAt || item.createdAt);
+                            return <div className="flex flex-col items-center justify-center gap-1"><span className="text-[15px] text-gray-800 tracking-wider">{dt.date}</span><span className="text-xs text-gray-500 font-mono">{dt.time}</span></div>;
+                        })()}
+                    </td>
+                    <td className="px-4 py-4 text-right align-middle">
+                        <div className="text-orange-600 font-mono text-base">{item.cny || 0} ¥</div>
+                    </td>
+                    <td className="px-4 py-4 text-right align-middle">
+                        <div className="text-gray-600 font-mono text-base">{item.cost?.toLocaleString()}원</div>
+                    </td>
+                    <td className="px-4 py-4 text-right align-middle">
+                        <div className="text-indigo-600 font-mono text-lg">{item.price?.toLocaleString()}원</div>
+                    </td>
+                    <td className="px-4 py-4 text-right align-middle pr-6">
+                        <div className="font-mono text-gray-800 text-base">{(item.price - item.cost)?.toLocaleString()}원</div>
+                        <div className="text-[11px] text-gray-400 font-mono mt-1">({item.price ? (((item.price - item.cost) / item.price) * 100).toFixed(1) : 0}%)</div>
+                    </td>
+
+                    {(settings.teamMembers || []).map((m, i) => (
+                        <td key={m.key} className={`px-3 py-4 text-center align-middle bg-gray-50/50 ${i === 0 ? 'border-l border-gray-100' : ''}`}>
+                            <StatusButton status={item.approvals?.[m.key] || 'pending'} onClick={() => { if (userRole === 'admin' || userKey === m.key) onToggleStatus(item, m.key); else showToast("본인 이름의 항목만 체크할 수 있습니다.", "error"); }} />
+                        </td>
+                    ))}
+                </tr>
+            );
+        }, (prev, next) => {
+            // 변경이 없을 때 리렌더링을 차단하여 버벅임 완벽 해소
+            return (
+                prev.item === next.item &&
+                prev.isSelected === next.isSelected &&
+                prev.isEditingNo === next.isEditingNo &&
+                prev.editingNoValue === next.editingNoValue &&
+                prev.idx === next.idx &&
+                prev.sortConfig.key === next.sortConfig.key &&
+                prev.sortConfig.direction === next.sortConfig.direction &&
+                prev.imageMapData === next.imageMapData &&
+                prev.comments === next.comments &&
+                prev.settings === next.settings
+            );
+        });
 
         function App({ userRole, userKey }) {
             const [activeMainCategory, setActiveMainCategory] = useState("전체");
@@ -583,29 +762,15 @@
                 return () => window.removeEventListener('keydown', handleKeyDown);
             }, [previewData]);
 
-            const formatDateTime = (timestamp) => {
-            if (!timestamp) return { date: '날짜모름', time: '' };
-            const dObj = new Date(timestamp);
-            if (isNaN(dObj.getTime())) return { date: '날짜모름', time: '' };
-            const y = String(dObj.getFullYear()).slice(-2);
-            const m = String(dObj.getMonth() + 1).padStart(2, '0');
-            const d = String(dObj.getDate()).padStart(2, '0');
-            const hh = String(dObj.getHours()).padStart(2, '0');
-            const mm = String(dObj.getMinutes()).padStart(2, '0');
-            return { date: `${y}-${m}-${d}`, time: `${hh}:${mm}` };
-        };
-
-        const showToast = (message, type = 'success') => {
-            setToast({ message, type });
-            setTimeout(() => setToast(null), 3000);
-        };
+            const showToast = useCallback((message, type = 'success') => {
+                setToast({ message, type });
+                setTimeout(() => setToast(null), 3000);
+            }, []);
 
         // Supabase 데이터 패치 및 실시간 구독
         useEffect(() => {
             const fetchInitialData = async () => {
                 try {
-                    // [중요 시스템 업그레이드] 
-                    // 타임아웃의 원인인 초거대 Base64 이미지 데이터를 초기 로딩에서 제외했습니다. (0.1초 컷 보장)
                     const [prodRes, globRes, secRes, comRes] = await Promise.all([
                         supabase.from('products').select('id, itemCode, project, mainCategory, category, name, option, cny, cost, price, links, naverLinks, isConfirmed, isFinalized, isHeld, isSampleRequested, isDeleted, approvals, customOrder, createdAt, updatedAt'),
                         supabase.from('global_settings').select('*').eq('id', 1).single(),
@@ -693,7 +858,11 @@
                         delete cleanItem.optionImage;
 
                         if (payload.eventType === 'INSERT') {
-                            setProducts(p => [...p, cleanItem]);
+                            setProducts(p => {
+                                const exists = p.find(x => x.id === cleanItem.id);
+                                if (exists) return p;
+                                return [...p, cleanItem];
+                            });
                             setImageMap(prev => ({ ...prev, [cleanItem.id]: { image: newImage, optionImage: newOptionImage } }));
                         }
                         else if (payload.eventType === 'UPDATE') {
@@ -752,27 +921,22 @@
                 return currentUserSettings?.isConfirmedOnly === true || String(currentUserSettings?.isConfirmedOnly) === 'true';
             }, [userRole, currentUserSettings]);
 
+            // 핵심 수정 포인트 2: .map() 객체 복제 로직 제거. (React.memo 무력화 방지)
             const displayProducts = useMemo(() => {
-                return products
-                    .filter(p => {
-                        if (isConfirmedOnlyView) {
-                            return p.isConfirmed || p.isFinalized || p.isSampleRequested;
-                        }
-                        return true;
-                    })
-                    .map(p => ({ 
-                        ...p, 
-                        mappedMainCategory: p.mainCategory || "미분류",
-                        mappedSubCategory: p.category || "미지정"
-                    }));
+                return products.filter(p => {
+                    if (isConfirmedOnlyView) {
+                        return p.isConfirmed || p.isFinalized || p.isSampleRequested;
+                    }
+                    return true;
+                });
             }, [products, isConfirmedOnlyView]);
 
             const filteredProducts = useMemo(() => {
                 let list = displayProducts.filter(p => !p.isDeleted);
                 if (activeProject !== "전체") list = list.filter(p => p.project === activeProject);
                 if (activeMainCategory !== "전체") {
-                    list = list.filter(p => p.mappedMainCategory === activeMainCategory);
-                    if (activeCategory !== "전체") list = list.filter(p => p.mappedSubCategory === activeCategory);
+                    list = list.filter(p => (p.mainCategory || "미분류") === activeMainCategory);
+                    if (activeCategory !== "전체") list = list.filter(p => (p.category || "미지정") === activeCategory);
                 }
                 if (searchTerm) {
                     const term = searchTerm.toLowerCase();
@@ -813,16 +977,40 @@
                 });
             }, [displayProducts, activeProject, activeMainCategory, activeCategory, searchTerm, filterStatus, sortConfig]);
 
-            const startEditingNo = (item, currentNo) => {
+
+            // =====================================================================
+            // [에러 방지 완벽 통제 시스템] - 에러 시 화면 롤백(되돌리기) 및 빨간 경고창 표시
+            // =====================================================================
+            const applyDbUpdate = useCallback(async (id, originalItem, changes, successMsg = null) => {
+                // 1. 화면 즉각 반응 (Optimistic Update)
+                setProducts(prev => prev.map(p => p.id === id ? { ...p, ...changes } : p));
+                
+                // 2. 실제 DB 저장 (여기서 실패를 잡아야 합니다)
+                const { error } = await supabase
+                    .from('products')
+                    .update({ ...changes, updatedAt: Date.now() })
+                    .eq('id', id);
+                    
+                // 3. 에러 발생 시 원래 상태로 롤백 및 에러 토스트 출력
+                if (error) {
+                    console.error("DB 업데이트 실패:", error);
+                    setProducts(prev => prev.map(p => p.id === id ? { ...p, ...originalItem } : p));
+                    showToast(`DB 저장 실패: ${error.message}`, "error"); // 원인 출력
+                } else if (successMsg) {
+                    showToast(successMsg);
+                }
+            }, [showToast]);
+
+            const startEditingNo = useCallback((item, currentNo) => {
                 if (sortConfig.key !== 'customOrder' || sortConfig.direction !== 'asc') {
                     showToast("오른쪽 위의 정렬 기준을 '내 임의 정렬 (수동)'으로 설정해야 순서를 바꿀 수 있습니다.", "error");
                     return;
                 }
                 setEditingNoId(item.id);
                 setEditingNoValue(currentNo.toString());
-            };
+            }, [sortConfig, showToast]);
 
-            const submitNewNo = async (item, currentIdx) => {
+            const submitNewNo = useCallback(async (item, currentIdx) => {
                 setEditingNoId(null);
                 const desiredNo = parseInt(editingNoValue, 10);
                 if (isNaN(desiredNo) || desiredNo <= 0) return;
@@ -843,13 +1031,16 @@
                     const afterOrder = tempArray[clampedTargetIdx].customOrder !== undefined ? tempArray[clampedTargetIdx].customOrder : -(tempArray[clampedTargetIdx].createdAt || 0);
                     newOrder = (beforeOrder + afterOrder) / 2;
                 }
-                try {
-                    await supabase.from('products').update({ customOrder: newOrder, updatedAt: Date.now() }).eq('id', item.id);
-                    showToast(`${desiredNo}번 위치로 즉시 이동되었습니다.`);
-                } catch(e) { console.error(e); showToast("순서 변경 오류", "error"); }
-            };
+                
+                applyDbUpdate(
+                    item.id, 
+                    { customOrder: item.customOrder }, 
+                    { customOrder: newOrder }, 
+                    `${desiredNo}번 위치로 이동되었습니다.`
+                );
+            }, [editingNoValue, filteredProducts, applyDbUpdate]);
 
-            const handleMoveOrder = async (idx, direction) => {
+            const handleMoveOrder = useCallback(async (idx, direction) => {
                 if (sortConfig.key !== 'customOrder' || sortConfig.direction !== 'asc') {
                     showToast("오른쪽 위의 정렬 기준을 '내 임의 정렬 (수동)'으로 설정해야 순서를 바꿀 수 있습니다.", "error");
                     return;
@@ -874,49 +1065,74 @@
                         newOrder = (targetOrder + afterOrder) / 2;
                     } else { newOrder = targetOrder + 1000; }
                 }
-                try {
-                    await supabase.from('products').update({ customOrder: newOrder, updatedAt: Date.now() }).eq('id', currentItem.id);
-                } catch(e) { console.error(e); showToast("순서 변경 오류", "error"); }
-            };
 
-            const toggleStatus = async (item, memberKey) => {
-                try {
-                    const current = item.approvals?.[memberKey] || 'pending';
-                    const next = current === 'approved' ? 'rejected' : (current === 'rejected' ? 'pending' : 'approved');
-                    await supabase.from('products').update({ 
-                        approvals: { ...(item.approvals || {}), [memberKey]: next }, 
-                        updatedAt: Date.now() 
-                    }).eq('id', item.id);
-                } catch(e) { 
-                    console.error("toggleStatus error:", e); 
-                    showToast("상태 변경 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.", "error");
+                applyDbUpdate(
+                    currentItem.id, 
+                    { customOrder: currentItem.customOrder }, 
+                    { customOrder: newOrder }
+                );
+            }, [filteredProducts, sortConfig, showToast, applyDbUpdate]);
+
+            const toggleStatus = useCallback((item, memberKey) => {
+                const current = item.approvals?.[memberKey] || 'pending';
+                const next = current === 'approved' ? 'rejected' : (current === 'rejected' ? 'pending' : 'approved');
+                const newApprovals = { ...(item.approvals || {}), [memberKey]: next };
+                
+                applyDbUpdate(
+                    item.id,
+                    { approvals: item.approvals },
+                    { approvals: newApprovals }
+                );
+            }, [applyDbUpdate]);
+
+            const toggleConfirm = useCallback((item) => {
+                const nextVal = !item.isConfirmed;
+                applyDbUpdate(
+                    item.id,
+                    { isConfirmed: item.isConfirmed, isHeld: item.isHeld, isFinalized: item.isFinalized },
+                    { isConfirmed: nextVal, isHeld: false, isFinalized: false }
+                );
+            }, [applyDbUpdate]);
+
+            const toggleFinalize = useCallback((item) => {
+                const nextVal = !item.isFinalized;
+                applyDbUpdate(
+                    item.id,
+                    { isFinalized: item.isFinalized, isConfirmed: item.isConfirmed, isHeld: item.isHeld },
+                    { isFinalized: nextVal, isConfirmed: false, isHeld: false }
+                );
+            }, [applyDbUpdate]);
+
+            const toggleHold = useCallback((item) => {
+                const nextVal = !item.isHeld;
+                applyDbUpdate(
+                    item.id,
+                    { isHeld: item.isHeld, isConfirmed: item.isConfirmed, isFinalized: item.isFinalized },
+                    { isHeld: nextVal, isConfirmed: false, isFinalized: false }
+                );
+            }, [applyDbUpdate]);
+
+            const toggleSample = useCallback((item) => {
+                const nextVal = !item.isSampleRequested;
+                applyDbUpdate(
+                    item.id,
+                    { isSampleRequested: item.isSampleRequested },
+                    { isSampleRequested: nextVal },
+                    nextVal ? "샘플이 신청되었습니다." : "샘플 신청이 취소되었습니다."
+                );
+            }, [applyDbUpdate]);
+
+            const handleDeleteItem = useCallback((item) => {
+                if(confirm('이 항목을 삭제하시겠습니까?')) {
+                    applyDbUpdate(
+                        item.id,
+                        { isDeleted: item.isDeleted },
+                        { isDeleted: true },
+                        "휴지통으로 이동되었습니다."
+                    );
                 }
-            };
+            }, [applyDbUpdate]);
 
-            const toggleConfirm = async (item) => {
-                try {
-                    await supabase.from('products').update({ isConfirmed: !item.isConfirmed, isHeld: false, isFinalized: false, updatedAt: Date.now() }).eq('id', item.id);
-                } catch(e) { showToast("오류 발생", "error"); }
-            };
-
-            const toggleFinalize = async (item) => {
-                try {
-                    await supabase.from('products').update({ isFinalized: !item.isFinalized, isConfirmed: false, isHeld: false, updatedAt: Date.now() }).eq('id', item.id);
-                } catch(e) { showToast("오류 발생", "error"); }
-            };
-
-            const toggleHold = async (item) => {
-                try {
-                    await supabase.from('products').update({ isHeld: !item.isHeld, isConfirmed: false, isFinalized: false, updatedAt: Date.now() }).eq('id', item.id);
-                } catch(e) { showToast("오류 발생", "error"); }
-            };
-
-            const toggleSample = async (item) => {
-                try {
-                    await supabase.from('products').update({ isSampleRequested: !item.isSampleRequested, updatedAt: Date.now() }).eq('id', item.id);
-                    showToast(item.isSampleRequested ? "샘플 신청이 취소되었습니다." : "샘플이 신청되었습니다.");
-                } catch(e) { showToast("오류 발생", "error"); }
-            };
 
             const handleAddOrUpdateProduct = async (e) => {
                 e.preventDefault();
@@ -930,10 +1146,11 @@
                 };
                 try {
                     if (editingItem) {
-                        await supabase.from('products').update(payload).eq('id', editingItem.id);
+                        const { error } = await supabase.from('products').update(payload).eq('id', editingItem.id);
+                        if (error) throw error;
                     } else {
                         const newItemCode = generateItemCode();
-                        await supabase.from('products').insert([{ 
+                        const { error } = await supabase.from('products').insert([{ 
                             ...payload, 
                             itemCode: newItemCode, 
                             createdAt: Date.now(), 
@@ -944,10 +1161,11 @@
                             isDeleted: false, 
                             approvals: {} 
                         }]);
+                        if (error) throw error;
                     }
                     setIsAddModalOpen(false);
                     showToast("저장되었습니다.");
-                } catch(e) { showToast("저장 오류", "error"); }
+                } catch(e) { showToast(`저장 오류: ${e.message}`, "error"); }
             };
 
             const handleSelectAll = (e) => {
@@ -955,33 +1173,35 @@
                 else setSelectedItems([]);
             };
 
-            const handleSelectItem = (id) => {
+            const handleSelectItem = useCallback((id) => {
                 setSelectedItems(prev => prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]);
-            };
+            }, []);
 
             const handleBulkDelete = async () => {
                 if (!confirm(`선택한 ${selectedItems.length}개 상품을 정말 삭제하시겠습니까?`)) return;
                 try {
-                    await supabase.from('products').update({ isDeleted: true, updatedAt: Date.now() }).in('id', selectedItems);
+                    const { error } = await supabase.from('products').update({ isDeleted: true, updatedAt: Date.now() }).in('id', selectedItems);
+                    if (error) throw error;
                     setSelectedItems([]);
                     showToast(`선택한 항목이 휴지통으로 이동되었습니다.`);
-                } catch (e) { showToast("삭제 중 오류가 발생했습니다.", "error"); }
+                } catch (e) { showToast(`삭제 오류: ${e.message}`, "error"); }
             };
 
             const handleBulkMove = async (e) => {
                 e.preventDefault();
                 if (!bulkMoveTarget.project || !bulkMoveTarget.mainCategory || !bulkMoveTarget.category) { showToast("모든 항목을 선택해주세요.", "error"); return; }
                 try {
-                    await supabase.from('products').update({ 
+                    const { error } = await supabase.from('products').update({ 
                         project: bulkMoveTarget.project, 
                         mainCategory: bulkMoveTarget.mainCategory, 
                         category: bulkMoveTarget.category, 
                         updatedAt: Date.now() 
                     }).in('id', selectedItems);
+                    if (error) throw error;
                     setIsBulkMoveModalOpen(false);
                     setSelectedItems([]);
                     showToast(`선택한 항목의 카테고리가 변경되었습니다.`);
-                } catch (e) { showToast("이동 중 오류가 발생했습니다.", "error"); }
+                } catch (e) { showToast(`이동 오류: ${e.message}`, "error"); }
             };
 
             const handleDownloadTemplate = () => {
@@ -1001,8 +1221,8 @@
                     return [
                         p.itemCode || p.id.slice(-6).toUpperCase(),
                         p.project || "",
-                        p.mappedMainCategory || "",
-                        p.mappedSubCategory || "",
+                        p.mainCategory || "미분류",
+                        p.category || "미지정",
                         `"${(p.name || "").replace(/"/g, '""')}"`,
                         `"${(p.option || "").replace(/"/g, '""')}"`,
                         p.cny || "",
@@ -1073,17 +1293,20 @@
                             
                             showToast(`데이터 업로드 중...`);
                             
-                            // 갱신 (Supabase에서는 여러 개의 각기 다른 데이터를 수정할 때 하나씩 혹은 upsert를 사용)
                             if (toUpdate.length > 0) {
-                                await Promise.all(toUpdate.map(item => supabase.from('products').update(item).eq('id', item.id)));
+                                await Promise.all(toUpdate.map(async (item) => {
+                                    const { error } = await supabase.from('products').update(item).eq('id', item.id);
+                                    if(error) throw error;
+                                }));
                             }
                             if (toInsert.length > 0) {
-                                await supabase.from('products').insert(toInsert);
+                                const { error } = await supabase.from('products').insert(toInsert);
+                                if(error) throw error;
                             }
                             
                             showToast(`신규 ${addCount}건, 수정 ${updateCount}건 완료`);
 
-                        } catch (err) { showToast("오류: " + err.message, "error"); } finally { setIsBulkModalOpen(false); if(fileInputRef.current) fileInputRef.current.value = ''; }
+                        } catch (err) { showToast("업로드 중 오류: " + err.message, "error"); } finally { setIsBulkModalOpen(false); if(fileInputRef.current) fileInputRef.current.value = ''; }
                     }
                 });
             };
@@ -1096,7 +1319,7 @@
                 setProductForm(prev => ({ ...prev, cny: val, cost: cost })); 
             };
 
-            const handleOpenPreview = (item, initialIndex = 0) => {
+            const handleOpenPreview = useCallback((item, initialIndex = 0) => {
                 const imgData = imageMap[item.id] || {};
                 const images = [];
                 if (imgData.image) images.push({ label: '대표 이미지', url: imgData.image });
@@ -1108,7 +1331,7 @@
                 } else {
                     showToast("아직 이미지를 불러오는 중이거나 이미지가 없습니다.", "info");
                 }
-            };
+            }, [imageMap, showToast]);
 
             const handleDownloadPDF = () => {
                 window.print();
@@ -1120,8 +1343,8 @@
                 displayProducts.forEach(p => {
                     if (p.isDeleted) return;
                     if (activeProject !== "전체" && p.project !== activeProject) return;
-                    const main = p.mappedMainCategory;
-                    const sub = p.mappedSubCategory;
+                    const main = p.mainCategory || "미분류";
+                    const sub = p.category || "미지정";
                     if (!groupsMap.has(main)) groupsMap.set(main, new Set());
                     groupsMap.get(main).add(sub);
                 });
@@ -1147,8 +1370,8 @@
                     if (filterStatus === 'held' && (!p.isHeld || p.isConfirmed || p.isFinalized)) return;
                     if (filterStatus === 'sample' && !p.isSampleRequested) return;
                     if (filterStatus === 'unconfirmed' && (p.isConfirmed || p.isHeld || p.isFinalized || p.isSampleRequested)) return;
-                    const mainCat = p.mappedMainCategory;
-                    const subCat = p.mappedSubCategory;
+                    const mainCat = p.mainCategory || "미분류";
+                    const subCat = p.category || "미지정";
                     counts.main[mainCat] = (counts.main[mainCat] || 0) + 1;
                     const subKey = `${mainCat}-${subCat}`;
                     counts.sub[subKey] = (counts.sub[subKey] || 0) + 1;
@@ -1179,7 +1402,7 @@
                                             {imageMap[item.id]?.image ? <img src={imageMap[item.id].image} /> : 'N/A'}
                                         </td>
                                         <td>
-                                            <div className="font-black text-indigo-600 mb-1">[{item.project}] {item.mainCategory} &gt; {item.category}</div>
+                                            <div className="font-black text-indigo-600 mb-1">[{item.project}] {item.mainCategory || "미분류"} &gt; {item.category || "미지정"}</div>
                                             <div className="text-sm font-black mb-1">#{item.itemCode || item.id.slice(-6).toUpperCase()}</div>
                                             <div className="text-base font-black">{item.name}</div>
                                             <div className="text-gray-500">{item.option || '옵션없음'}</div>
@@ -1278,7 +1501,7 @@
                                         )
                                     })}
                                 </div>
-                                <CurrencyCalculatorSidebar exchangeRate={settings.exchangeRate} onRateChange={async (r) => { await supabase.from('global_settings').update({ exchangeRate: r }).eq('id', 1); showToast("환율 업데이트 완료"); }} userRole={userRole} />
+                                <CurrencyCalculatorSidebar exchangeRate={settings.exchangeRate} onRateChange={async (r) => { const {error} = await supabase.from('global_settings').update({ exchangeRate: r }).eq('id', 1); if(error){ showToast("오류: " + error.message, "error"); } else { showToast("환율 업데이트 완료"); } }} userRole={userRole} />
                                 
                                 <div className="px-1 space-y-1">
                                     <a href="https://drive.google.com/drive/folders/1wVi8o8T-Vas4mRnBfaI9E_8ualBsqmxR?usp=sharing" target="_blank" className="w-full bg-indigo-50 border border-indigo-100 p-2.5 rounded-xl flex items-center gap-2 text-xs text-indigo-700 hover:bg-indigo-100 mb-2 transition-colors">
@@ -1409,139 +1632,36 @@
                                             </thead>
                                             <tbody className="divide-y divide-gray-100">
                                                 {filteredProducts.map((item, idx) => (
-                                                    <tr key={item.id} className={`hover:bg-gray-50/50 transition-colors ${item.isFinalized ? 'bg-red-50/40' : item.isConfirmed ? 'bg-green-50/30' : item.isHeld ? 'bg-amber-50/30' : ''} ${selectedItems.includes(item.id) ? 'bg-blue-50/30' : ''}`}>
-                                                        {userRole === 'admin' && (
-                                                            <td className="px-4 py-4 text-center align-middle">
-                                                                <input type="checkbox" checked={selectedItems.includes(item.id)} onChange={() => handleSelectItem(item.id)} className="w-4 h-4 accent-indigo-600 cursor-pointer"/>
-                                                            </td>
-                                                        )}
-                                                        <td className="px-2 py-4 text-center font-black align-middle">
-                                                            {editingNoId === item.id ? (
-                                                                <input type="number" value={editingNoValue} onChange={(e) => setEditingNoValue(e.target.value)} onBlur={() => submitNewNo(item, idx)} onKeyDown={(e) => { if (e.key === 'Enter') submitNewNo(item, idx); else if (e.key === 'Escape') setEditingNoId(null); }} className="w-12 text-center border-2 border-indigo-400 rounded outline-none text-indigo-700 py-1" autoFocus />
-                                                            ) : (
-                                                                <div onClick={() => { if (userRole === 'admin') startEditingNo(item, idx + 1); else showToast("팀원은 순서를 변경할 수 없습니다.", "error"); }} className={`inline-block px-2 py-1.5 rounded font-mono text-sm transition-all ${userRole === 'admin' && sortConfig.key === 'customOrder' ? 'cursor-pointer text-indigo-600 bg-indigo-50 hover:bg-indigo-100 hover:scale-110 border border-indigo-100 shadow-sm' : 'text-gray-400'}`} title="숫자를 클릭하여 원하는 순서로 즉시 이동">
-                                                                    {idx + 1}
-                                                                </div>
-                                                            )}
-                                                        </td>
-                                                        <td className="px-2 py-4 text-center align-middle">
-                                                            {userRole === 'admin' && sortConfig.key === 'customOrder' && sortConfig.direction === 'asc' ? (
-                                                                <div className="flex flex-col items-center justify-center gap-1">
-                                                                    <button onClick={() => handleMoveOrder(idx, 'up')} disabled={idx === 0} className="w-7 h-7 flex items-center justify-center bg-gray-100 rounded-md hover:bg-indigo-100 hover:text-indigo-600 disabled:opacity-20 transition-all shadow-sm border"><ChevronUp className="w-4 h-4" /></button>
-                                                                    <button onClick={() => handleMoveOrder(idx, 'down')} disabled={idx === filteredProducts.length - 1} className="w-7 h-7 flex items-center justify-center bg-gray-100 rounded-md hover:bg-indigo-100 hover:text-indigo-600 disabled:opacity-20 transition-all shadow-sm border"><ChevronDown className="w-4 h-4" /></button>
-                                                                </div>
-                                                            ) : <span className="text-[10px] text-gray-300">-</span>}
-                                                        </td>
-                                                        
-                                                        <td className="px-2 py-4 pl-6 align-middle">
-                                                            <div className="flex items-center justify-center gap-2">
-                                                                {imageMap[item.id] ? (
-                                                                    <React.Fragment>
-                                                                        <div className="w-16 h-16 bg-gray-50 rounded-lg flex flex-col items-center justify-center overflow-hidden border cursor-pointer relative group shadow-inner flex-shrink-0" onClick={() => handleOpenPreview(item, 0)} title="대표 이미지">
-                                                                            {imageMap[item.id].image ? <img src={imageMap[item.id].image} className="absolute inset-0 w-full h-full object-cover" /> : <ImageIcon className="w-6 h-6 text-gray-200"/>}
-                                                                            <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all z-10"><ZoomIn className="text-white w-5 h-5"/></div>
-                                                                        </div>
-                                                                        {imageMap[item.id].optionImage && (
-                                                                            <div className="w-16 h-16 bg-amber-50 rounded-lg flex items-center justify-center overflow-hidden border border-amber-200 cursor-pointer relative group shadow-inner flex-shrink-0" onClick={() => handleOpenPreview(item, 1)} title="옵션 이미지">
-                                                                                <img src={imageMap[item.id].optionImage} className="absolute inset-0 w-full h-full object-cover" />
-                                                                                <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all z-10"><ZoomIn className="text-white w-5 h-5"/></div>
-                                                                                <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[9px] text-center font-black py-0.5 z-10">옵션</div>
-                                                                            </div>
-                                                                        )}
-                                                                    </React.Fragment>
-                                                                ) : (
-                                                                    <div className="w-16 h-16 bg-gray-50 border border-gray-200 rounded-xl flex flex-col items-center justify-center shadow-sm relative flex-shrink-0">
-                                                                        <div className="w-4 h-4 border-2 border-gray-200 border-t-indigo-500 rounded-full animate-spin mb-1"></div>
-                                                                        <span className="text-[7px] text-gray-400 font-bold">로딩중</span>
-                                                                    </div>
-                                                                )}
-                                                            </div>
-                                                        </td>
-                                                        <td className="px-6 py-4 min-w-[200px] align-middle">
-                                                            <div className="flex flex-col gap-0.5">
-                                                                <div className="flex items-center gap-1.5 mb-1">
-                                                                    <span className="text-[9px] bg-indigo-50 text-indigo-500 px-1.5 py-0.5 rounded border border-indigo-100">{item.project}</span>
-                                                                    <span className="text-[9px] text-gray-400">{item.mappedMainCategory} &gt; {item.mappedSubCategory}</span>
-                                                                </div>
-                                                                <div className="text-gray-900 line-clamp-1 flex items-center gap-2 text-base">
-                                                                    <span className="text-[9px] text-gray-400 font-mono border border-gray-200 px-1 rounded bg-gray-50">#{item.itemCode || item.id.slice(-6).toUpperCase()}</span>
-                                                                    {item.name}
-                                                                </div>
-                                                                <div className="text-xs text-gray-400 italic line-clamp-1 mt-1">{item.option || '옵션없음'}</div>
-                                                                <div className="flex gap-1.5 mt-2">
-                                                                    {(item.links || []).filter(l => l).map((l, i) => <a key={i} href={l} target="_blank" className="bg-orange-50 text-orange-600 text-[9px] px-1.5 py-0.5 rounded border border-orange-100 hover:bg-orange-100 transition-colors">소싱 #{i+1}</a>)}
-                                                                    {(item.naverLinks || []).filter(l => l).map((l, i) => <a key={i} href={l} target="_blank" className="bg-green-50 text-green-600 text-[9px] px-1.5 py-0.5 rounded border border-green-100 hover:bg-green-100 transition-colors">경쟁 #{i+1}</a>)}
-                                                                </div>
-                                                            </div>
-                                                        </td>
-
-                                                        <td className="px-3 py-4 align-middle">
-                                                            <div className="grid grid-cols-2 gap-1.5 w-max mx-auto">
-                                                                {userRole === 'admin' ? (
-                                                                    <>
-                                                                        <button onClick={() => toggleFinalize(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isFinalized ? 'bg-red-600 text-white shadow-md' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="확정"><Flag className="w-3 h-3"/> 확정</button>
-                                                                        <button onClick={() => toggleConfirm(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isConfirmed ? 'bg-green-600 text-white shadow-md' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="선택"><CheckCircle className="w-3 h-3"/> 선택</button>
-                                                                        <button onClick={() => toggleSample(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isSampleRequested ? 'bg-blue-600 text-white shadow-md' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="샘플신청"><Truck className="w-3 h-3"/> 샘플</button>
-                                                                        <button onClick={() => toggleHold(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isHeld ? 'bg-amber-50/30 text-amber-500 border border-amber-200' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="보류"><Clock className="w-3 h-3"/> 보류</button>
-                                                                        <button onClick={() => { const imgData = imageMap[item.id] || {}; const fullItem = { ...item, image: imgData.image, optionImage: imgData.optionImage }; setEditingItem(fullItem); setProductForm({ ...fullItem, links: fullItem.links || [''], naverLinks: fullItem.naverLinks || [''] }); setIsAddModalOpen(true); }} className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] text-gray-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all" title="수정"><Edit2 className="w-3 h-3"/> 수정</button>
-                                                                        <button onClick={async () => { if(confirm('삭제하시겠습니까?')) { await supabase.from('products').update({ isDeleted: true, updatedAt: Date.now() }).eq('id', item.id); showToast("휴지통으로 이동되었습니다."); } }} className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all" title="삭제"><Trash2 className="w-3 h-3"/> 삭제</button>
-                                                                    </>
-                                                                ) : (
-                                                                    <>
-                                                                        {item.isFinalized && <span className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg bg-red-100 text-red-700 border border-red-200"><Flag className="w-3 h-3"/> 확정</span>}
-                                                                        {item.isConfirmed && <span className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg bg-green-100 text-green-700 border border-green-200"><CheckCircle className="w-3 h-3"/> 선택</span>}
-                                                                        <button onClick={() => toggleSample(item)} className={`w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg transition-all ${item.isSampleRequested ? 'bg-blue-600 text-white shadow-md' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`} title="샘플신청"><Truck className="w-3 h-3"/> 샘플</button>
-                                                                        
-                                                                        {item.isHeld && <span className="w-full px-2 py-1.5 flex items-center justify-center gap-1 text-[11px] rounded-lg bg-amber-100 text-amber-700 border border-amber-200"><Clock className="w-3 h-3"/> 보류</span>}
-                                                                        
-                                                                        {!item.isConfirmed && !item.isFinalized && !item.isHeld && !item.isSampleRequested && <span className="w-full text-[11px] text-gray-400 px-2 py-1.5 flex items-center justify-center col-span-2">진행중</span>}
-                                                                    </>
-                                                                )}
-                                                            </div>
-                                                        </td>
-
-                                                        <td className="px-4 py-4 w-72 min-w-[280px] align-middle bg-gray-50/30 border-r border-gray-100">
-                                                            <InlineComments 
-                                                                productId={item.id}
-                                                                comments={commentsByProduct[item.id] || []}
-                                                                userKey={userKey}
-                                                                userRole={userRole}
-                                                                teamMembers={settings.teamMembers}
-                                                            />
-                                                        </td>
-
-                                                        <td className="px-4 py-4 text-center align-middle">
-                                                            {(() => {
-                                                                const dt = formatDateTime(item.createdAt);
-                                                                return <div className="flex flex-col items-center justify-center gap-1"><span className="text-[15px] text-gray-800 tracking-wider">{dt.date}</span><span className="text-xs text-gray-500 font-mono">{dt.time}</span></div>;
-                                                            })()}
-                                                        </td>
-                                                        <td className="px-4 py-4 text-center align-middle">
-                                                            {(() => {
-                                                                const dt = formatDateTime(item.updatedAt || item.createdAt);
-                                                                return <div className="flex flex-col items-center justify-center gap-1"><span className="text-[15px] text-gray-800 tracking-wider">{dt.date}</span><span className="text-xs text-gray-500 font-mono">{dt.time}</span></div>;
-                                                            })()}
-                                                        </td>
-                                                        <td className="px-4 py-4 text-right align-middle">
-                                                            <div className="text-orange-600 font-mono text-base">{item.cny || 0} ¥</div>
-                                                        </td>
-                                                        <td className="px-4 py-4 text-right align-middle">
-                                                            <div className="text-gray-600 font-mono text-base">{item.cost?.toLocaleString()}원</div>
-                                                        </td>
-                                                        <td className="px-4 py-4 text-right align-middle">
-                                                            <div className="text-indigo-600 font-mono text-lg">{item.price?.toLocaleString()}원</div>
-                                                        </td>
-                                                        <td className="px-4 py-4 text-right align-middle pr-6">
-                                                            <div className="font-mono text-gray-800 text-base">{(item.price - item.cost)?.toLocaleString()}원</div>
-                                                            <div className="text-[11px] text-gray-400 font-mono mt-1">({item.price ? (((item.price - item.cost) / item.price) * 100).toFixed(1) : 0}%)</div>
-                                                        </td>
-
-                                                        {(settings.teamMembers || []).map((m, i) => (
-                                                            <td key={m.key} className={`px-3 py-4 text-center align-middle bg-gray-50/50 ${i === 0 ? 'border-l border-gray-100' : ''}`}>
-                                                                <StatusButton status={item.approvals?.[m.key] || 'pending'} onClick={() => { if (userRole === 'admin' || userKey === m.key) toggleStatus(item, m.key); else showToast("본인 이름의 항목만 체크할 수 있습니다.", "error"); }} />
-                                                            </td>
-                                                        ))}
-                                                    </tr>
+                                                    <ProductTableRow
+                                                        key={item.id}
+                                                        item={item}
+                                                        idx={idx}
+                                                        isSelected={selectedItems.includes(item.id)}
+                                                        isEditingNo={editingNoId === item.id}
+                                                        editingNoValue={editingNoValue}
+                                                        userRole={userRole}
+                                                        userKey={userKey}
+                                                        sortConfig={sortConfig}
+                                                        imageMapData={imageMap[item.id]}
+                                                        comments={commentsByProduct[item.id]}
+                                                        settings={settings}
+                                                        onSetEditingNoValue={setEditingNoValue}
+                                                        onSubmitNewNo={submitNewNo}
+                                                        onStartEditingNo={startEditingNo}
+                                                        onMoveOrder={handleMoveOrder}
+                                                        onOpenPreview={handleOpenPreview}
+                                                        onToggleFinalize={toggleFinalize}
+                                                        onToggleConfirm={toggleConfirm}
+                                                        onToggleSample={toggleSample}
+                                                        onToggleHold={toggleHold}
+                                                        onSetEditingItem={setEditingItem}
+                                                        onSetProductForm={setProductForm}
+                                                        onSetIsAddModalOpen={setIsAddModalOpen}
+                                                        onSelectItem={handleSelectItem}
+                                                        onToggleStatus={toggleStatus}
+                                                        onToggleDelete={handleDeleteItem}
+                                                        showToast={showToast}
+                                                    />
                                                 ))}
                                             </tbody>
                                         </table>
@@ -1712,16 +1832,17 @@
                             </div>
                         )}
 
-                        {isSystemSettingsOpen && <SystemSettingsModal currentProjects={settings.projects} currentTeam={settings.teamMembers} currentSecurity={security} onClose={() => setIsSystemSettingsOpen(false)} onSave={async (p, t, s) => { await supabase.from('global_settings').update({ projects: p, teamMembers: t }).eq('id', 1); await supabase.from('security_settings').update({ master: s.master, memberPasswords: s.memberPasswords }).eq('id', 1); setIsSystemSettingsOpen(false); showToast("설정 저장됨"); }} />}
+                        {isSystemSettingsOpen && <SystemSettingsModal currentProjects={settings.projects} currentTeam={settings.teamMembers} currentSecurity={security} onClose={() => setIsSystemSettingsOpen(false)} onSave={async (p, t, s) => { const {error} = await supabase.from('global_settings').update({ projects: p, teamMembers: t }).eq('id', 1); const {error2} = await supabase.from('security_settings').update({ master: s.master, memberPasswords: s.memberPasswords }).eq('id', 1); if(error || error2){ showToast("설정 저장 실패", "error");} else { setIsSystemSettingsOpen(false); showToast("설정 저장됨"); } }} />}
                         
                         {isCategorySettingsOpen && <CategorySettingsModal currentGroups={settings.categoryGroups} currentFees={settings.categoryFees} currentRatios={settings.categoryRatios} onClose={() => setIsCategorySettingsOpen(false)} onSave={async (g, f, r, bulk) => { 
-                            await supabase.from('global_settings').update({ categoryGroups: g, categoryFees: f, categoryRatios: r }).eq('id', 1); 
+                            const { error } = await supabase.from('global_settings').update({ categoryGroups: g, categoryFees: f, categoryRatios: r }).eq('id', 1); 
+                            if(error){ showToast("분류 저장 실패", "error"); return; }
                             if(bulk) { 
                                 const toUpdate = products.filter(p => p.cny).map(p => ({
                                     id: p.id,
                                     cost: Math.round(p.cny * settings.exchangeRate * (r[p.category]||1)) + (f[p.category]||0)
                                 }));
-                                await Promise.all(toUpdate.map(u => supabase.from('products').update({ cost: u.cost }).eq('id', u.id)));
+                                await Promise.all(toUpdate.map(async (u) => { await supabase.from('products').update({ cost: u.cost }).eq('id', u.id); }));
                             } 
                             setIsCategorySettingsOpen(false); 
                             showToast("분류 저장됨"); 
@@ -1750,8 +1871,8 @@
                                                         </div>
                                                     </div>
                                                     <div className="flex gap-2">
-                                                        <button onClick={async () => { await supabase.from('products').update({ isDeleted: false, updatedAt: Date.now() }).eq('id', item.id); showToast("항목이 복구되었습니다."); }} className="px-3 py-2 bg-white border border-green-200 text-green-600 rounded-lg text-xs hover:bg-green-50 transition-colors flex items-center gap-1 shadow-sm"><RotateCcw className="w-3.5 h-3.5"/> 복구</button>
-                                                        <button onClick={async () => { if(confirm("이 항목을 영구적으로 삭제하시겠습니까?")) { await supabase.from('products').delete().eq('id', item.id); showToast("영구 삭제되었습니다."); } }} className="px-3 py-2 bg-white border border-red-200 text-red-600 rounded-lg text-xs hover:bg-red-50 transition-colors flex items-center gap-1 shadow-sm"><Trash2 className="w-3.5 h-3.5"/> 영구삭제</button>
+                                                        <button onClick={async () => { const {error} = await supabase.from('products').update({ isDeleted: false, updatedAt: Date.now() }).eq('id', item.id); if(error) showToast("복구 실패", "error"); else showToast("항목이 복구되었습니다."); }} className="px-3 py-2 bg-white border border-green-200 text-green-600 rounded-lg text-xs hover:bg-green-50 transition-colors flex items-center gap-1 shadow-sm"><RotateCcw className="w-3.5 h-3.5"/> 복구</button>
+                                                        <button onClick={async () => { if(confirm("이 항목을 영구적으로 삭제하시겠습니까?")) { const {error} = await supabase.from('products').delete().eq('id', item.id); if(error) showToast("삭제 실패", "error"); else showToast("영구 삭제되었습니다."); } }} className="px-3 py-2 bg-white border border-red-200 text-red-600 rounded-lg text-xs hover:bg-red-50 transition-colors flex items-center gap-1 shadow-sm"><Trash2 className="w-3.5 h-3.5"/> 영구삭제</button>
                                                     </div>
                                                 </div>
                                             ))
